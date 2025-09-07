@@ -8,6 +8,9 @@ on:
         required: false
         type: string
         default: ""
+  schedule:
+    # 每天 北京时间 03:00 运行（UTC=19:00）
+    - cron: "0 19 * * *"
 
 jobs:
   build-and-push:
@@ -26,7 +29,6 @@ jobs:
       - name: Checkout repository (for overlays/scripts)
         uses: actions/checkout@v4
 
-      # 先不启用缓存，避免根目录无 lockfile 报错
       - name: Setup Node.js 18 (no cache yet)
         uses: actions/setup-node@v4
         with:
@@ -38,7 +40,7 @@ jobs:
           sudo apt-get install -y jq unzip rsync perl
           npm i -g pnpm@8 yarn
 
-      # ---- Docker Hub 密钥自检（提前失败，避免到最后才提示） ----
+      # ---- Docker Hub 密钥自检 ----
       - name: Assert Docker Hub credentials exist
         run: |
           set -e
@@ -78,14 +80,13 @@ jobs:
           echo "Downloading: $URL"
           curl -L -sS "$URL" -o "$FILE"
           tar -xzf "$FILE" -C work/src
-          # 识别解压顶层目录
           ROOT="work/src"
           EXTRACTED=$(find "$ROOT" -mindepth 1 -maxdepth 1 -type d | head -n1)
           echo "extracted_dir=$EXTRACTED" >> "$GITHUB_OUTPUT"
           echo "Extracted dir: $EXTRACTED"
 
-      # ---------- 覆盖（你的 TutorialView.vue 等） ----------
-      - name: Apply overlay (complete replacements)
+      # ---------- 通用覆盖（overlay 若按原目录结构摆放可直接覆盖） ----------
+      - name: Apply overlay (generic rsync)
         run: |
           set -euo pipefail
           if [ -d "${OVERLAY_DIR}" ]; then
@@ -93,6 +94,22 @@ jobs:
             rsync -a "${OVERLAY_DIR}/" "${{ steps.ext.outputs.extracted_dir }}/"
           else
             echo "No overlay dir found: ${OVERLAY_DIR} (skip)"
+          fi
+
+      # ---------- 强制使用你仓库的 TutorialView.vue 覆盖到目标路径 ----------
+      - name: Force replace TutorialView.vue with your overlay file
+        run: |
+          set -euo pipefail
+          SRC_FILE="${OVERLAY_DIR}/TutorialView.vue"
+          DEST_DIR="${{ steps.ext.outputs.extracted_dir }}/web/admin-spa/src/views"
+          if [ -f "$SRC_FILE" ]; then
+            mkdir -p "$DEST_DIR"
+            cp -f "$SRC_FILE" "$DEST_DIR/TutorialView.vue"
+            echo "✅ Copied ${SRC_FILE} -> ${DEST_DIR}/TutorialView.vue"
+            echo "### TutorialView.vue (first 5 lines from overlay) ###"
+            head -n 5 "$SRC_FILE" || true
+          else
+            echo "::warning::${SRC_FILE} not found. Put your file at overlays/default/TutorialView.vue"
           fi
 
       # ---------- 注释 ApiStatsView.vue 的 <router-link> 整段 ----------
@@ -118,8 +135,7 @@ jobs:
             exit 0
           fi
 
-          echo "Scanning for console/debugger..."
-          # 1) 处理 .vue：在 <script> 后插入禁用注释
+          # 1) .vue：在 <script> 后插入禁用注释（若未插入）
           mapfile -t VUE_FILES < <(grep -RIl --include="*.vue" -E 'console\.[a-zA-Z]+|[^a-zA-Z]debugger[^a-zA-Z]' "$SRC" || true)
           for f in "${VUE_FILES[@]}"; do
             perl -0777 -pe 'BEGIN{$/=undef}
@@ -127,7 +143,7 @@ jobs:
             ' -i "$f"
           done
 
-          # 2) 处理 .js/.ts：文件首行注入禁用注释（若未注入过）
+          # 2) .js/.ts：首行注入禁用注释（若未注入）
           mapfile -t JS_TS_FILES < <(grep -RIl --include="*.js" --include="*.ts" -E 'console\.[a-zA-Z]+|[^a-zA-Z]debugger[^a-zA-Z]' "$SRC" || true)
           for f in "${JS_TS_FILES[@]}"; do
             if ! head -n 1 "$f" | grep -q 'eslint-disable no-console'; then
@@ -137,11 +153,6 @@ jobs:
               mv "$tmp" "$f"
             fi
           done
-
-          echo "Patched .vue files:"
-          printf ' - %s\n' "${VUE_FILES[@]}" || true
-          echo "Patched .js/.ts files:"
-          printf ' - %s\n' "${JS_TS_FILES[@]}" || true
 
       # ---------- 自动探测包管理器与锁文件，并启用缓存 ----------
       - name: Detect package manager & lockfile
@@ -191,7 +202,7 @@ jobs:
               yarn build || npm run build
               ;;
             npm|*)
-              if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+              if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ] ; then
                 npm ci || npm install
               else
                 npm install
