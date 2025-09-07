@@ -1,0 +1,131 @@
+name: Build & Push evanora/claude-code-relay
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "可选：指定上游 Release 标签（留空=latest）"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      UPSTREAM_OWNER: Wei-Shaw
+      UPSTREAM_REPO: claude-relay-service
+      DOCKERHUB_REPO: evanora/claude-code-relay
+      OVERLAY_DIR: overlays/default
+
+    steps:
+      - name: Checkout (for overlays/scripts)
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: "npm"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 8
+          run_install: false
+
+      - name: Setup yarn
+        run: npm install -g yarn
+
+      - name: Install system deps
+        run: sudo apt-get update -y && sudo apt-get install -y jq unzip rsync
+
+      # ====== 获取上游 Release ======
+      - name: Resolve release
+        id: rel
+        env:
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "$TAG" ]; then
+            API="https://api.github.com/repos/${UPSTREAM_OWNER}/${UPSTREAM_REPO}/releases/tags/${TAG}"
+          else
+            API="https://api.github.com/repos/${UPSTREAM_OWNER}/${UPSTREAM_REPO}/releases/latest"
+          fi
+          curl -sS -L "$API" -o release.json
+          TAG_NAME=$(jq -r .tag_name release.json)
+          echo "tag=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          echo "download_url=$(jq -r .tarball_url release.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Download & extract
+        id: ext
+        run: |
+          mkdir -p downloads work/src
+          URL="${{ steps.rel.outputs.download_url }}"
+          FILE="downloads/payload"
+          curl -L -sS "$URL" -o "$FILE"
+          tar -xzf "$FILE" -C work/src
+          ROOT="work/src"
+          FIRST_TOP=$(find "$ROOT" -mindepth 1 -maxdepth 1 -type d | head -n1)
+          echo "extracted_dir=$FIRST_TOP" >> "$GITHUB_OUTPUT"
+
+      # ====== 覆盖和补丁 ======
+      - name: Apply overlay
+        run: |
+          if [ -d "$OVERLAY_DIR" ]; then
+            rsync -a "$OVERLAY_DIR"/ "${{ steps.ext.outputs.extracted_dir }}"/
+          fi
+
+      - name: Patch ApiStatsView.vue
+        run: |
+          TARGET="${{ steps.ext.outputs.extracted_dir }}/web/admin-spa/src/views/ApiStatsView.vue"
+          if [ -f "$TARGET" ]; then
+            perl -0777 -pe 's#<router-link[\s\S]*?</router-link>#<!-- $& -->#g' -i "$TARGET"
+          fi
+
+      # ====== 前端构建 ======
+      - name: Build frontend
+        working-directory: ${{ steps.ext.outputs.extracted_dir }}/web/admin-spa
+        run: |
+          set -euo pipefail
+          PM=""
+          if command -v pnpm >/dev/null 2>&1 && [ -f "pnpm-lock.yaml" ]; then
+            PM="pnpm"
+          elif command -v yarn >/dev/null 2>&1 && [ -f "yarn.lock" ]; then
+            PM="yarn"
+          else
+            PM="npm"
+          fi
+          echo "🧰 使用包管理器：$PM"
+          case "$PM" in
+            pnpm) pnpm install --frozen-lockfile || pnpm install ;;
+            yarn) yarn install --frozen-lockfile || yarn install ;;
+            npm)  [ -f package-lock.json ] && npm ci || npm install ;;
+          esac
+          npm run build || yarn build || pnpm build
+
+      # ====== Docker Build & Push ======
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & Push Docker
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ steps.ext.outputs.extracted_dir }}
+          file: ${{ steps.ext.outputs.extracted_dir }}/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.DOCKERHUB_REPO }}:${{ steps.rel.outputs.tag }}
+            ${{ env.DOCKERHUB_REPO }}:latest
