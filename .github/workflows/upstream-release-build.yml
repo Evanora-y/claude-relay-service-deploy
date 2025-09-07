@@ -27,22 +27,19 @@ jobs:
       - name: Checkout repository (for overlays/scripts)
         uses: actions/checkout@v4
 
-      - name: Setup Node.js 18
+      # 先不启用缓存，避免根目录无 lockfile 报错
+      - name: Setup Node.js 18 (no cache yet)
         uses: actions/setup-node@v4
         with:
           node-version: 18
-          cache: npm
-
-      - name: Setup pnpm & yarn
-        run: |
-          npm i -g pnpm@8 yarn
 
       - name: Install system deps
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq unzip rsync perl
+          npm i -g pnpm@8 yarn
 
-      # ---- 获取上游 Release 元数据 ----
+      # ---------- 获取上游 Release 元数据 ----------
       - name: Resolve release
         id: rel
         env:
@@ -57,11 +54,11 @@ jobs:
           curl -sS -L "$API" -o release.json
           TAG_NAME=$(jq -r .tag_name release.json)
           echo "tag=$TAG_NAME" >> "$GITHUB_OUTPUT"
-          # 使用源码 tarball（上游有时 asset 不稳定）
+          # 直接使用源码 tarball（稳定通用）
           TARBALL=$(jq -r .tarball_url release.json)
           echo "download_url=$TARBALL" >> "$GITHUB_OUTPUT"
 
-      # ---- 下载并解压 ----
+      # ---------- 下载并解压 ----------
       - name: Download & extract
         id: ext
         run: |
@@ -76,8 +73,9 @@ jobs:
           ROOT="work/src"
           EXTRACTED=$(find "$ROOT" -mindepth 1 -maxdepth 1 -type d | head -n1)
           echo "extracted_dir=$EXTRACTED" >> "$GITHUB_OUTPUT"
+          echo "Extracted dir: $EXTRACTED"
 
-      # ---- 覆盖（你的 TutorialView.vue 等） ----
+      # ---------- 覆盖（你的 TutorialView.vue 等） ----------
       - name: Apply overlay (complete replacements)
         run: |
           set -euo pipefail
@@ -88,42 +86,77 @@ jobs:
             echo "No overlay dir found: ${OVERLAY_DIR} (skip)"
           fi
 
-      # ---- 注释 ApiStatsView.vue 的 <router-link> 整段 ----
-      - name: Patch ApiStatsView.vue
+      # ---------- 注释 ApiStatsView.vue 的 <router-link> 整段 ----------
+      - name: Patch ApiStatsView.vue (comment <router-link> block)
         run: |
           set -euo pipefail
           TARGET="${{ steps.ext.outputs.extracted_dir }}/web/admin-spa/src/views/ApiStatsView.vue"
           if [ -f "$TARGET" ]; then
+            # 用 Perl 做跨行替换：把 <router-link ... </router-link> 整段包上 HTML 注释
             perl -0777 -pe 's#<router-link[\s\S]*?</router-link>#<!-- $& -->#g' -i "$TARGET"
             echo "Patched: $TARGET"
           else
             echo "WARN: $TARGET 不存在，跳过"
           fi
 
-      # ---- 前端构建 ----
+      # ---------- 自动探测包管理器与锁文件，并二次启用带缓存的 setup-node ----------
+      - name: Detect package manager & lockfile
+        id: pm
+        run: |
+          set -euo pipefail
+          APP="${{ steps.ext.outputs.extracted_dir }}/web/admin-spa"
+          if [ -f "$APP/pnpm-lock.yaml" ]; then
+            echo "pm=pnpm" >> "$GITHUB_OUTPUT"
+            echo "lockfile=$APP/pnpm-lock.yaml" >> "$GITHUB_OUTPUT"
+          elif [ -f "$APP/yarn.lock" ]; then
+            echo "pm=yarn" >> "$GITHUB_OUTPUT"
+            echo "lockfile=$APP/yarn.lock" >> "$GITHUB_OUTPUT"
+          elif [ -f "$APP/package-lock.json" ]; then
+            echo "pm=npm" >> "$GITHUB_OUTPUT"
+            echo "lockfile=$APP/package-lock.json" >> "$GITHUB_OUTPUT"
+          elif [ -f "$APP/npm-shrinkwrap.json" ]; then
+            echo "pm=npm" >> "$GITHUB_OUTPUT"
+            echo "lockfile=$APP/npm-shrinkwrap.json" >> "$GITHUB_OUTPUT"
+          else
+            echo "pm=npm" >> "$GITHUB_OUTPUT"
+            echo "lockfile=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Enable cache for setup-node (optional)
+        if: ${{ steps.pm.outputs.lockfile != '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: ${{ steps.pm.outputs.pm }} # npm / yarn / pnpm
+          cache-dependency-path: ${{ steps.pm.outputs.lockfile }}
+
+      # ---------- 前端构建 ----------
       - name: Build frontend
         working-directory: ${{ steps.ext.outputs.extracted_dir }}/web/admin-spa
         run: |
           set -euo pipefail
-          if command -v pnpm >/dev/null 2>&1 && [ -f "pnpm-lock.yaml" ]; then
-            echo "Using pnpm"
-            pnpm install --frozen-lockfile || pnpm install
-            pnpm build || npm run build || yarn build
-          elif command -v yarn >/dev/null 2>&1 && [ -f "yarn.lock" ]; then
-            echo "Using yarn"
-            yarn install --frozen-lockfile || yarn install
-            yarn build || npm run build
-          else
-            echo "Using npm"
-            if [ -f "package-lock.json" ]; then
-              npm ci || npm install
-            else
-              npm install
-            fi
-            npm run build || yarn build
-          fi
+          PM="${{ steps.pm.outputs.pm }}"
+          echo "Using PM: $PM"
+          case "$PM" in
+            pnpm)
+              [ -f pnpm-lock.yaml ] && pnpm install --frozen-lockfile || pnpm install
+              pnpm build || npm run build || yarn build
+              ;;
+            yarn)
+              [ -f yarn.lock ] && yarn install --frozen-lockfile || yarn install
+              yarn build || npm run build
+              ;;
+            npm|*)
+              if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+                npm ci || npm install
+              else
+                npm install
+              fi
+              npm run build || yarn build
+              ;;
+          esac
 
-      # ---- Docker ----
+      # ---------- Docker ----------
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
