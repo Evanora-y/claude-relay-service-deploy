@@ -13,7 +13,6 @@ jobs:
   build-and-push:
     name: Build & Push
     runs-on: ubuntu-latest
-
     permissions:
       contents: read
 
@@ -38,6 +37,16 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y jq unzip rsync perl
           npm i -g pnpm@8 yarn
+
+      # ---- Docker Hub 密钥自检（提前失败，避免到最后才提示） ----
+      - name: Assert Docker Hub credentials exist
+        run: |
+          set -e
+          if [ -z "${{ secrets.DOCKERHUB_USERNAME }}" ] || [ -z "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+            echo "::error::Docker Hub credentials missing. Please set DOCKERHUB_USERNAME and DOCKERHUB_TOKEN in Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          echo "Docker Hub credentials are present."
 
       # ---------- 获取上游 Release 元数据 ----------
       - name: Resolve release
@@ -98,8 +107,8 @@ jobs:
             echo "WARN: $TARGET 不存在，跳过"
           fi
 
-      # ---------- 在 CI 中放宽 ESLint（处理 Unexpected console statement 等） ----------
-      - name: Relax ESLint rules for CI (no-console/no-debugger)
+      # ---------- 在 CI 中放宽 ESLint（含 .vue + .js/.ts） ----------
+      - name: Relax ESLint rules for CI (no-console/no-debugger in .vue & .js/.ts)
         run: |
           set -euo pipefail
           APP="${{ steps.ext.outputs.extracted_dir }}/web/admin-spa"
@@ -109,25 +118,32 @@ jobs:
             exit 0
           fi
 
-          # 找出包含 console. 或 debugger 的 .vue 文件
-          mapfile -t FILES < <(grep -RIl --include="*.vue" -E 'console\.[a-zA-Z]+|[^a-zA-Z]debugger[^a-zA-Z]' "$SRC" || true)
-          if [ ${#FILES[@]} -eq 0 ]; then
-            echo "No files with console/debugger found. Skip patch."
-            exit 0
-          fi
-
-          echo "Patching ${#FILES[@]} files to disable ESLint rules in CI..."
-          for f in "${FILES[@]}"; do
-            # 在 <script ...> 开标签后插入一次性禁用；若已插入则跳过
+          echo "Scanning for console/debugger..."
+          # 1) 处理 .vue：在 <script> 后插入禁用注释
+          mapfile -t VUE_FILES < <(grep -RIl --include="*.vue" -E 'console\.[a-zA-Z]+|[^a-zA-Z]debugger[^a-zA-Z]' "$SRC" || true)
+          for f in "${VUE_FILES[@]}"; do
             perl -0777 -pe 'BEGIN{$/=undef}
               s!(<script[^>]*>)!$1\n/* eslint-disable no-console, no-debugger */!s if $_ !~ m!eslint-disable no-console!;
             ' -i "$f"
           done
 
-          echo "Patched files:"
-          printf ' - %s\n' "${FILES[@]}"
+          # 2) 处理 .js/.ts：文件首行注入禁用注释（若未注入过）
+          mapfile -t JS_TS_FILES < <(grep -RIl --include="*.js" --include="*.ts" -E 'console\.[a-zA-Z]+|[^a-zA-Z]debugger[^a-zA-Z]' "$SRC" || true)
+          for f in "${JS_TS_FILES[@]}"; do
+            if ! head -n 1 "$f" | grep -q 'eslint-disable no-console'; then
+              tmp="$(mktemp)"
+              printf "/* eslint-disable no-console, no-debugger */\n" > "$tmp"
+              cat "$f" >> "$tmp"
+              mv "$tmp" "$f"
+            fi
+          done
 
-      # ---------- 自动探测包管理器与锁文件，并二次启用带缓存的 setup-node ----------
+          echo "Patched .vue files:"
+          printf ' - %s\n' "${VUE_FILES[@]}" || true
+          echo "Patched .js/.ts files:"
+          printf ' - %s\n' "${JS_TS_FILES[@]}" || true
+
+      # ---------- 自动探测包管理器与锁文件，并启用缓存 ----------
       - name: Detect package manager & lockfile
         id: pm
         run: |
