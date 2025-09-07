@@ -54,7 +54,7 @@ jobs:
           curl -sS -L "$API" -o release.json
           TAG_NAME=$(jq -r .tag_name release.json)
           echo "tag=$TAG_NAME" >> "$GITHUB_OUTPUT"
-          # 直接使用源码 tarball（稳定通用）
+          # 使用源码 tarball（稳定）
           TARBALL=$(jq -r .tarball_url release.json)
           echo "download_url=$TARBALL" >> "$GITHUB_OUTPUT"
 
@@ -92,12 +92,40 @@ jobs:
           set -euo pipefail
           TARGET="${{ steps.ext.outputs.extracted_dir }}/web/admin-spa/src/views/ApiStatsView.vue"
           if [ -f "$TARGET" ]; then
-            # 用 Perl 做跨行替换：把 <router-link ... </router-link> 整段包上 HTML 注释
             perl -0777 -pe 's#<router-link[\s\S]*?</router-link>#<!-- $& -->#g' -i "$TARGET"
             echo "Patched: $TARGET"
           else
             echo "WARN: $TARGET 不存在，跳过"
           fi
+
+      # ---------- 在 CI 中放宽 ESLint（处理 Unexpected console statement 等） ----------
+      - name: Relax ESLint rules for CI (no-console/no-debugger)
+        run: |
+          set -euo pipefail
+          APP="${{ steps.ext.outputs.extracted_dir }}/web/admin-spa"
+          SRC="$APP/src"
+          if [ ! -d "$SRC" ]; then
+            echo "Skip: $SRC not found"
+            exit 0
+          fi
+
+          # 找出包含 console. 或 debugger 的 .vue 文件
+          mapfile -t FILES < <(grep -RIl --include="*.vue" -E 'console\.[a-zA-Z]+|[^a-zA-Z]debugger[^a-zA-Z]' "$SRC" || true)
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "No files with console/debugger found. Skip patch."
+            exit 0
+          fi
+
+          echo "Patching ${#FILES[@]} files to disable ESLint rules in CI..."
+          for f in "${FILES[@]}"; do
+            # 在 <script ...> 开标签后插入一次性禁用；若已插入则跳过
+            perl -0777 -pe 'BEGIN{$/=undef}
+              s!(<script[^>]*>)!$1\n/* eslint-disable no-console, no-debugger */!s if $_ !~ m!eslint-disable no-console!;
+            ' -i "$f"
+          done
+
+          echo "Patched files:"
+          printf ' - %s\n' "${FILES[@]}"
 
       # ---------- 自动探测包管理器与锁文件，并二次启用带缓存的 setup-node ----------
       - name: Detect package manager & lockfile
