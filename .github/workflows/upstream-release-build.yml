@@ -11,9 +11,12 @@ on:
 
 jobs:
   build-and-push:
+    name: Build & Push
     runs-on: ubuntu-latest
+
     permissions:
       contents: read
+
     env:
       UPSTREAM_OWNER: Wei-Shaw
       UPSTREAM_REPO: claude-relay-service
@@ -21,28 +24,25 @@ jobs:
       OVERLAY_DIR: overlays/default
 
     steps:
-      - name: Checkout (for overlays/scripts)
+      - name: Checkout repository (for overlays/scripts)
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node.js 18
         uses: actions/setup-node@v4
         with:
           node-version: 18
-          cache: "npm"
+          cache: npm
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 8
-          run_install: false
-
-      - name: Setup yarn
-        run: npm install -g yarn
+      - name: Setup pnpm & yarn
+        run: |
+          npm i -g pnpm@8 yarn
 
       - name: Install system deps
-        run: sudo apt-get update -y && sudo apt-get install -y jq unzip rsync
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq unzip rsync perl
 
-      # ====== 获取上游 Release ======
+      # ---- 获取上游 Release 元数据 ----
       - name: Resolve release
         id: rel
         env:
@@ -57,69 +57,86 @@ jobs:
           curl -sS -L "$API" -o release.json
           TAG_NAME=$(jq -r .tag_name release.json)
           echo "tag=$TAG_NAME" >> "$GITHUB_OUTPUT"
-          echo "download_url=$(jq -r .tarball_url release.json)" >> "$GITHUB_OUTPUT"
+          # 使用源码 tarball（上游有时 asset 不稳定）
+          TARBALL=$(jq -r .tarball_url release.json)
+          echo "download_url=$TARBALL" >> "$GITHUB_OUTPUT"
 
+      # ---- 下载并解压 ----
       - name: Download & extract
         id: ext
         run: |
+          set -euo pipefail
           mkdir -p downloads work/src
           URL="${{ steps.rel.outputs.download_url }}"
-          FILE="downloads/payload"
+          FILE="downloads/src.tgz"
+          echo "Downloading: $URL"
           curl -L -sS "$URL" -o "$FILE"
           tar -xzf "$FILE" -C work/src
+          # 识别解压顶层目录
           ROOT="work/src"
-          FIRST_TOP=$(find "$ROOT" -mindepth 1 -maxdepth 1 -type d | head -n1)
-          echo "extracted_dir=$FIRST_TOP" >> "$GITHUB_OUTPUT"
+          EXTRACTED=$(find "$ROOT" -mindepth 1 -maxdepth 1 -type d | head -n1)
+          echo "extracted_dir=$EXTRACTED" >> "$GITHUB_OUTPUT"
 
-      # ====== 覆盖和补丁 ======
-      - name: Apply overlay
+      # ---- 覆盖（你的 TutorialView.vue 等） ----
+      - name: Apply overlay (complete replacements)
         run: |
-          if [ -d "$OVERLAY_DIR" ]; then
-            rsync -a "$OVERLAY_DIR"/ "${{ steps.ext.outputs.extracted_dir }}"/
+          set -euo pipefail
+          if [ -d "${OVERLAY_DIR}" ]; then
+            echo "Overlay: ${OVERLAY_DIR} -> ${{ steps.ext.outputs.extracted_dir }}"
+            rsync -a "${OVERLAY_DIR}/" "${{ steps.ext.outputs.extracted_dir }}/"
+          else
+            echo "No overlay dir found: ${OVERLAY_DIR} (skip)"
           fi
 
+      # ---- 注释 ApiStatsView.vue 的 <router-link> 整段 ----
       - name: Patch ApiStatsView.vue
         run: |
+          set -euo pipefail
           TARGET="${{ steps.ext.outputs.extracted_dir }}/web/admin-spa/src/views/ApiStatsView.vue"
           if [ -f "$TARGET" ]; then
             perl -0777 -pe 's#<router-link[\s\S]*?</router-link>#<!-- $& -->#g' -i "$TARGET"
+            echo "Patched: $TARGET"
+          else
+            echo "WARN: $TARGET 不存在，跳过"
           fi
 
-      # ====== 前端构建 ======
+      # ---- 前端构建 ----
       - name: Build frontend
         working-directory: ${{ steps.ext.outputs.extracted_dir }}/web/admin-spa
         run: |
           set -euo pipefail
-          PM=""
           if command -v pnpm >/dev/null 2>&1 && [ -f "pnpm-lock.yaml" ]; then
-            PM="pnpm"
+            echo "Using pnpm"
+            pnpm install --frozen-lockfile || pnpm install
+            pnpm build || npm run build || yarn build
           elif command -v yarn >/dev/null 2>&1 && [ -f "yarn.lock" ]; then
-            PM="yarn"
+            echo "Using yarn"
+            yarn install --frozen-lockfile || yarn install
+            yarn build || npm run build
           else
-            PM="npm"
+            echo "Using npm"
+            if [ -f "package-lock.json" ]; then
+              npm ci || npm install
+            else
+              npm install
+            fi
+            npm run build || yarn build
           fi
-          echo "🧰 使用包管理器：$PM"
-          case "$PM" in
-            pnpm) pnpm install --frozen-lockfile || pnpm install ;;
-            yarn) yarn install --frozen-lockfile || yarn install ;;
-            npm)  [ -f package-lock.json ] && npm ci || npm install ;;
-          esac
-          npm run build || yarn build || pnpm build
 
-      # ====== Docker Build & Push ======
+      # ---- Docker ----
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login Docker Hub
+      - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build & Push Docker
+      - name: Build & Push Docker (amd64)
         uses: docker/build-push-action@v6
         with:
           context: ${{ steps.ext.outputs.extracted_dir }}
@@ -129,3 +146,9 @@ jobs:
           tags: |
             ${{ env.DOCKERHUB_REPO }}:${{ steps.rel.outputs.tag }}
             ${{ env.DOCKERHUB_REPO }}:latest
+
+      - name: Summary
+        run: |
+          echo "✅ Pushed:"
+          echo " - ${{ env.DOCKERHUB_REPO }}:${{ steps.rel.outputs.tag }}"
+          echo " - ${{ env.DOCKERHUB_REPO }}:latest"
